@@ -1,0 +1,67 @@
+version: 2.1
+
+jobs:
+  workspace:
+    docker:
+      - image: cimg/rust:1.96
+    environment:
+      RUST_BACKTRACE: "1"
+      # Build bundled PCRE2 without installing system packages.
+      PCRE2_SYS_STATIC: "1"
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - cargo-workspace-v1-1.96-{{ arch }}-{{ checksum "Cargo.lock" }}
+      - run:
+          name: Install dependencies
+          command: cargo fetch --locked
+      - save_cache:
+          key: cargo-workspace-v1-1.96-{{ arch }}-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+      - run:
+          name: Build workspace
+          command: cargo build --verbose --workspace
+      - run:
+          name: Build with PCRE2
+          command: cargo build --verbose --workspace --features pcre2
+      - run:
+          name: Test with indexing enabled
+          command: cargo test --verbose --workspace --features unstable-index
+      - run:
+          name: Test with PCRE2
+          command: cargo test --verbose --workspace --features pcre2
+      - run:
+          name: Check formatting
+          command: cargo fmt --all --check
+
+  fuzz:
+    docker:
+      - image: cimg/rust:1.96
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - cargo-fuzz-v1-1.96-{{ arch }}-{{ checksum "fuzz/Cargo.lock" }}
+      - run:
+          name: Install fuzz dependencies
+          working_directory: ~/project/fuzz
+          command: cargo fetch --locked
+      - save_cache:
+          key: cargo-fuzz-v1-1.96-{{ arch }}-{{ checksum "fuzz/Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+      # Existing CI compiles fuzz targets; it defines no fuzz test or lint command.
+      - run:
+          name: Check fuzz targets compile
+          working_directory: ~/project/fuzz
+          command: cargo check
+
+workflows:
+  starter:
+    jobs:
+      - workspace
+      - fuzz
