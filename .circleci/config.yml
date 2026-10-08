@@ -1,0 +1,425 @@
+# CircleCI configuration for ripgrep.
+#
+# This mirrors .github/workflows/ci.yml, which is treated as the source of
+# truth for what CI should do. Every command below comes from that workflow or
+# from the scripts in ci/. See .circleci/README-TRANSLATION.md for the list of
+# GitHub Actions steps that could not be translated 1:1.
+version: 2.1
+
+orbs:
+  win: circleci/windows@5.0.0
+
+parameters:
+  # Pinned MSRV, taken from [workspace.package] rust-version in Cargo.toml.
+  msrv:
+    type: string
+    default: "1.96"
+
+executors:
+  # cimg/rust ships rustup, so non-pinned toolchains are installed on top of
+  # the MSRV image rather than selecting a different base image.
+  linux:
+    docker:
+    - image: cimg/rust:1.96
+    resource_class: large
+    working_directory: ~/project
+  # 'cross' needs a real Docker daemon that shares a filesystem with the
+  # checkout, so the cross-compilation jobs use a machine executor.
+  linux-machine:
+    machine:
+      image: ubuntu-2404:2024.11.1
+    resource_class: large
+    working_directory: ~/project
+  macos:
+    macos:
+      xcode: 16.2.0
+    resource_class: macos.m1.medium.gen1
+    working_directory: ~/project
+
+commands:
+  install_toolchain:
+    parameters:
+      toolchain:
+        type: string
+      components:
+        type: string
+        default: ""
+      targets:
+        type: string
+        default: ""
+    steps:
+    - run:
+        name: Install Rust << parameters.toolchain >>
+        command: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain none --profile minimal
+            echo 'source "$HOME/.cargo/env"' >> "$BASH_ENV"
+            source "$HOME/.cargo/env"
+          fi
+          rustup toolchain install << parameters.toolchain >> --profile minimal
+          rustup default << parameters.toolchain >>
+          if [ -n "<< parameters.components >>" ]; then
+            rustup component add --toolchain << parameters.toolchain >> << parameters.components >>
+          fi
+          if [ -n "<< parameters.targets >>" ]; then
+            rustup target add --toolchain << parameters.toolchain >> << parameters.targets >>
+          fi
+          rustc --version && cargo --version
+
+  restore_cargo_cache:
+    parameters:
+      key:
+        type: string
+      lockfile:
+        type: string
+        default: Cargo.lock
+    steps:
+    - restore_cache:
+        keys:
+        - cargo-v1-<< parameters.key >>-{{ checksum "<< parameters.lockfile >>" }}
+        - cargo-v1-<< parameters.key >>-
+
+  save_cargo_cache:
+    parameters:
+      key:
+        type: string
+      lockfile:
+        type: string
+        default: Cargo.lock
+    steps:
+    - save_cache:
+        key: cargo-v1-<< parameters.key >>-{{ checksum "<< parameters.lockfile >>" }}
+        paths:
+        - ~/.cargo/registry
+        - ~/.cargo/git
+        - target
+
+  show_build_stderr:
+    # Mirrors the "Show build.rs stderr" step. Also copies the log into
+    # /tmp/artifacts so it survives as a build artifact, which is the whole
+    # point of the step upstream (debugging missing completions/man pages).
+    parameters:
+      target_dir:
+        type: string
+        default: ./target
+    steps:
+    - run:
+        name: Show build.rs stderr
+        command: |
+          mkdir -p /tmp/artifacts
+          stderr="$(find "<< parameters.target_dir >>/debug" -name stderr -print0 | xargs -0 ls -t | head -n1)"
+          if [ -s "$stderr" ]; then
+            echo "===== $stderr ====="
+            cat "$stderr"
+            echo "====="
+            cp "$stderr" /tmp/artifacts/build-rs-stderr.log
+          fi
+
+jobs:
+  # Mirrors the ubuntu-latest, non-cross entries of the GHA 'test' matrix
+  # (pinned / stable / beta / nightly).
+  test:
+    executor: linux
+    parameters:
+      toolchain:
+        type: string
+    environment:
+      RUST_BACKTRACE: "1"
+      TARGET_DIR: ./target
+    steps:
+    - checkout
+    - run:
+        name: Install packages (Ubuntu)
+        command: ci/ubuntu-install-packages
+    - install_toolchain:
+        toolchain: << parameters.toolchain >>
+    - restore_cargo_cache:
+        key: test-<< parameters.toolchain >>
+    - run:
+        name: Build ripgrep and all crates
+        command: cargo build --verbose --workspace
+    - run:
+        name: Build ripgrep with PCRE2
+        command: cargo build --verbose --workspace --features pcre2
+    - show_build_stderr
+    - run:
+        name: Run tests with indexing enabled
+        command: cargo test --verbose --workspace --features unstable-index
+    - run:
+        name: Run tests with PCRE2
+        command: cargo test --verbose --workspace --features pcre2
+    - run:
+        name: Test zsh shell completions
+        command: ci/test-complete
+    - run:
+        name: Print hostname detected by grep-cli crate
+        command: cargo test --manifest-path crates/cli/Cargo.toml --lib print_hostname -- --nocapture
+    - run:
+        name: Print available short flags
+        command: cargo test --bin rg flags::defs::tests::available_shorts -- --nocapture
+    - save_cargo_cache:
+        key: test-<< parameters.toolchain >>
+    - store_artifacts:
+        path: /tmp/artifacts
+
+  # Mirrors the cross-compiled entries of the GHA 'test' matrix.
+  test-cross:
+    executor: linux-machine
+    parameters:
+      target:
+        type: string
+    environment:
+      RUST_BACKTRACE: "1"
+      # Pinned for the same reason the upstream workflow pins it: past 'cross'
+      # releases have broken CI in subtle ways.
+      CROSS_VERSION: v0.2.5
+    steps:
+    - checkout
+    - run:
+        name: Install packages (Ubuntu)
+        command: ci/ubuntu-install-packages
+    - install_toolchain:
+        toolchain: stable
+    - run:
+        name: Use Cross
+        command: |
+          dir="$HOME/cross-download"
+          mkdir -p "$dir"
+          cd "$dir"
+          curl -LO "https://github.com/cross-rs/cross/releases/download/$CROSS_VERSION/cross-x86_64-unknown-linux-musl.tar.gz"
+          tar xf cross-x86_64-unknown-linux-musl.tar.gz
+          echo "export PATH=\"$dir:\$PATH\"" >> "$BASH_ENV"
+          echo 'export CARGO=cross' >> "$BASH_ENV"
+          echo 'export TARGET_FLAGS="--target << parameters.target >>"' >> "$BASH_ENV"
+          echo 'export TARGET_DIR="./target/<< parameters.target >>"' >> "$BASH_ENV"
+    - run:
+        name: Show command used for Cargo
+        command: |
+          echo "cargo command is: $CARGO"
+          echo "target flag is: $TARGET_FLAGS"
+          echo "target dir is: $TARGET_DIR"
+    - restore_cargo_cache:
+        key: cross-<< parameters.target >>
+    - run:
+        name: Build ripgrep and all crates
+        command: $CARGO build --verbose --workspace $TARGET_FLAGS
+    - run:
+        name: Build ripgrep with PCRE2
+        command: $CARGO build --verbose --workspace --features pcre2 $TARGET_FLAGS
+    - show_build_stderr:
+        target_dir: ./target/<< parameters.target >>
+    - run:
+        name: Run tests with indexing enabled
+        command: $CARGO test --verbose --workspace --features unstable-index $TARGET_FLAGS
+    - run:
+        # Upstream skips PCRE2 tests under cross: every integration test spins
+        # up qemu, and PCRE2 runs the whole suite a second time.
+        name: Run tests without PCRE2
+        command: $CARGO test --verbose --workspace $TARGET_FLAGS
+    - run:
+        name: Print hostname detected by grep-cli crate
+        command: $CARGO test --manifest-path crates/cli/Cargo.toml $TARGET_FLAGS --lib print_hostname -- --nocapture
+    - run:
+        name: Print available short flags
+        command: $CARGO test --bin rg $TARGET_FLAGS flags::defs::tests::available_shorts -- --nocapture
+    - save_cargo_cache:
+        key: cross-<< parameters.target >>
+    - store_artifacts:
+        path: /tmp/artifacts
+
+  # Mirrors the 'macos' entry of the GHA test matrix (nightly on macos-latest).
+  test-macos:
+    executor: macos
+    environment:
+      RUST_BACKTRACE: "1"
+      TARGET_DIR: ./target
+    steps:
+    - checkout
+    - install_toolchain:
+        toolchain: nightly
+    - restore_cargo_cache:
+        key: macos-nightly
+    - run:
+        name: Build ripgrep and all crates
+        command: cargo build --verbose --workspace
+    - run:
+        name: Build ripgrep with PCRE2
+        command: cargo build --verbose --workspace --features pcre2
+    - show_build_stderr
+    - run:
+        name: Run tests with indexing enabled
+        command: cargo test --verbose --workspace --features unstable-index
+    - run:
+        name: Run tests with PCRE2
+        command: cargo test --verbose --workspace --features pcre2
+    - run:
+        name: Test zsh shell completions
+        command: ci/test-complete
+    - run:
+        name: Print hostname detected by grep-cli crate
+        command: cargo test --manifest-path crates/cli/Cargo.toml --lib print_hostname -- --nocapture
+    - run:
+        name: Print available short flags
+        command: cargo test --bin rg flags::defs::tests::available_shorts -- --nocapture
+    - save_cargo_cache:
+        key: macos-nightly
+    - store_artifacts:
+        path: /tmp/artifacts
+
+  # Mirrors the 'win-msvc' and 'win-gnu' entries of the GHA test matrix.
+  # ci/test-complete is skipped on Windows upstream too.
+  test-windows:
+    executor:
+      name: win/default
+      shell: bash.exe
+    parameters:
+      toolchain:
+        type: string
+    environment:
+      RUST_BACKTRACE: "1"
+      TARGET_DIR: ./target
+    steps:
+    - checkout
+    - run:
+        name: Install Rust << parameters.toolchain >>
+        command: |
+          rustup toolchain install << parameters.toolchain >> --profile minimal
+          rustup default << parameters.toolchain >>
+          rustc --version && cargo --version
+    - restore_cargo_cache:
+        key: windows-<< parameters.toolchain >>
+    - run:
+        name: Build ripgrep and all crates
+        command: cargo build --verbose --workspace
+    - run:
+        name: Build ripgrep with PCRE2
+        command: cargo build --verbose --workspace --features pcre2
+    - show_build_stderr
+    - run:
+        name: Run tests with indexing enabled
+        command: cargo test --verbose --workspace --features unstable-index
+    - run:
+        name: Run tests with PCRE2
+        command: cargo test --verbose --workspace --features pcre2
+    - run:
+        name: Print hostname detected by grep-cli crate
+        command: cargo test --manifest-path crates/cli/Cargo.toml --lib print_hostname -- --nocapture
+    - run:
+        name: Print available short flags
+        command: cargo test --bin rg flags::defs::tests::available_shorts -- --nocapture
+    - save_cargo_cache:
+        key: windows-<< parameters.toolchain >>
+    - store_artifacts:
+        path: /tmp/artifacts
+
+  # Mirrors the GHA 'wasm' job.
+  wasm:
+    executor: linux
+    steps:
+    - checkout
+    - install_toolchain:
+        toolchain: stable
+        targets: wasm32-wasip1
+    - restore_cargo_cache:
+        key: wasm
+    - run:
+        name: Basic build
+        command: cargo build --verbose
+    - save_cargo_cache:
+        key: wasm
+
+  # Mirrors the GHA 'rustfmt' job.
+  rustfmt:
+    executor: linux
+    steps:
+    - checkout
+    - install_toolchain:
+        toolchain: stable
+        components: rustfmt
+    - run:
+        name: Check formatting
+        command: cargo fmt --all --check
+
+  # Mirrors the GHA 'docs' job.
+  docs:
+    executor: linux
+    environment:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+    - checkout
+    - install_toolchain:
+        toolchain: stable
+    - restore_cargo_cache:
+        key: docs
+    - run:
+        name: Check documentation
+        command: cargo doc --no-deps --document-private-items --workspace
+    - save_cargo_cache:
+        key: docs
+    - store_artifacts:
+        path: target/doc
+        destination: doc
+
+  # Mirrors the GHA 'fuzz_testing' job. fuzz/ declares its own [workspace] and
+  # has its own Cargo.lock, so it is a separate project with its own
+  # working_directory and its own cache key.
+  fuzz:
+    executor: linux
+    working_directory: ~/project/fuzz
+    steps:
+    - checkout:
+        path: ~/project
+    - run:
+        name: Install required packages (Ubuntu)
+        command: |
+          sudo apt-get update
+          sudo apt-get install g++ --yes
+    - install_toolchain:
+        toolchain: stable
+    - restore_cargo_cache:
+        key: fuzz
+    - run:
+        name: Install Fuzzer
+        command: cargo install cargo-fuzz
+    - run:
+        name: Verify fuzz targets build
+        command: cargo check
+    - save_cargo_cache:
+        key: fuzz
+
+workflows:
+  # Runs on every push and pull request. The nightly cron from ci.yml is NOT
+  # expressed here -- see .circleci/README-TRANSLATION.md.
+  ci:
+    jobs:
+    - test:
+        name: test-<< matrix.toolchain >>
+        matrix:
+          parameters:
+            toolchain: ["1.96", stable, beta, nightly]
+    - test-cross:
+        name: test-cross-<< matrix.target >>
+        matrix:
+          parameters:
+            target:
+            - x86_64-unknown-linux-musl
+            - i686-unknown-linux-gnu
+            - aarch64-unknown-linux-gnu
+            - aarch64-unknown-linux-musl
+            - armv7-unknown-linux-gnueabihf
+            - armv7-unknown-linux-musleabihf
+            - armv7-unknown-linux-musleabi
+            - powerpc64-unknown-linux-gnu
+            - s390x-unknown-linux-gnu
+            - riscv64gc-unknown-linux-gnu
+    - test-macos
+    - test-windows:
+        name: test-windows-<< matrix.toolchain >>
+        matrix:
+          parameters:
+            toolchain: [nightly, nightly-x86_64-pc-windows-gnu]
+    - wasm
+    - rustfmt
+    - docs
+    - fuzz
