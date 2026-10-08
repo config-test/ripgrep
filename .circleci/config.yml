@@ -1,0 +1,74 @@
+version: 2.1
+
+# Starter config for ripgrep (Rust workspace, edition 2024, MSRV 1.96).
+# Intentionally minimal: Linux/Docker only, no matrices, no cross-compilation,
+# no release/deploy steps. See .github/workflows/ci.yml for the full matrix.
+
+jobs:
+  # The root workspace: the `rg` binary plus every crate under crates/.
+  ripgrep:
+    docker:
+      # MSRV from Cargo.toml (workspace.package.rust-version = "1.96"), which
+      # is also what the "pinned" job in the GitHub Actions matrix uses.
+      - image: cimg/rust:1.96
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_NET_RETRY: "3"
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - cargo-v1-{{ checksum "Cargo.lock" }}
+            - cargo-v1-
+      - run:
+          name: Install dependencies
+          command: cargo fetch --locked
+      - save_cache:
+          key: cargo-v1-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+      - run:
+          name: Build
+          command: cargo build --verbose --workspace
+      - run:
+          name: Test
+          command: cargo test --verbose --workspace
+      - run:
+          name: Lint (rustfmt)
+          command: cargo fmt --all --check
+
+  # fuzz/ is its own workspace (fuzz/Cargo.toml pins `members = ["."]`) and is
+  # built separately by the existing CI, so it gets its own job. There is no
+  # test or lint step here: upstream CI only verifies that the targets compile.
+  fuzz:
+    docker:
+      - image: cimg/rust:1.96
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_NET_RETRY: "3"
+    working_directory: ~/project/fuzz
+    steps:
+      - checkout:
+          path: ~/project
+      - restore_cache:
+          keys:
+            - cargo-fuzz-v1-{{ checksum "Cargo.lock" }}
+            - cargo-fuzz-v1-
+      - run:
+          name: Install dependencies
+          command: cargo fetch --locked
+      - save_cache:
+          key: cargo-fuzz-v1-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+      - run:
+          name: Build (verify fuzz targets compile)
+          command: cargo check --verbose
+
+workflows:
+  ci:
+    jobs:
+      - ripgrep
+      - fuzz
