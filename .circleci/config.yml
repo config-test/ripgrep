@@ -1,0 +1,76 @@
+version: 2.1
+
+# Starter CI for ripgrep.
+#
+# This builds and tests the Cargo workspace (ripgrep plus the crates in
+# crates/) and type-checks the standalone fuzz crate, which lives outside the
+# workspace and has its own lockfile.
+
+jobs:
+  test-workspace:
+    docker:
+      # Matches the MSRV declared in Cargo.toml (workspace.package.rust-version)
+      # and the "pinned" build in .github/workflows/ci.yml.
+      - image: cimg/rust:1.96
+    environment:
+      # Pin CARGO_HOME so the cache paths below are stable.
+      CARGO_HOME: /home/circleci/.cargo
+      RUST_BACKTRACE: "1"
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-cargo-workspace-{{ checksum "Cargo.lock" }}
+            - v1-cargo-workspace-
+      - run:
+          name: Show toolchain versions
+          command: |
+            rustc --version
+            cargo --version
+      - run:
+          name: Fetch dependencies
+          command: cargo fetch --locked
+      - run:
+          name: Test workspace
+          command: cargo test --workspace --locked --verbose
+      - save_cache:
+          key: v1-cargo-workspace-{{ checksum "Cargo.lock" }}
+          paths:
+            - /home/circleci/.cargo/registry
+            - /home/circleci/.cargo/git
+            - target
+
+  check-fuzz:
+    docker:
+      - image: cimg/rust:1.96
+    environment:
+      CARGO_HOME: /home/circleci/.cargo
+      RUST_BACKTRACE: "1"
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-cargo-fuzz-{{ checksum "fuzz/Cargo.lock" }}
+            - v1-cargo-fuzz-
+      - run:
+          name: Fetch dependencies
+          command: cargo fetch --locked
+          working_directory: ~/project/fuzz
+      - run:
+          # The fuzz targets are only compiled here, never run. Running them
+          # needs cargo-fuzz and a nightly toolchain.
+          name: Check fuzz targets
+          command: cargo check --locked
+          working_directory: ~/project/fuzz
+      - save_cache:
+          key: v1-cargo-fuzz-{{ checksum "fuzz/Cargo.lock" }}
+          paths:
+            - /home/circleci/.cargo/registry
+            - /home/circleci/.cargo/git
+            - fuzz/target
+
+workflows:
+  ci:
+    jobs:
+      - test-workspace
+      - check-fuzz
