@@ -1,0 +1,35 @@
+version: 2.1
+
+jobs:
+  ripgrep:
+    docker:
+      - image: cimg/rust:1.99
+    environment:
+      RUST_BACKTRACE: "1"
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-cargo-{{ checksum "Cargo.lock" }}
+      - run:
+          name: Install dependencies
+          command: cargo fetch --locked
+      - save_cache:
+          key: v1-cargo-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+      - run:
+          name: Build
+          command: cargo build --verbose --workspace
+      - run:
+          name: Test
+          command: cargo test --verbose --workspace --features unstable-index
+      - run:
+          name: Lint
+          command: cargo fmt --all --check
+
+workflows:
+  main:
+    jobs:
+      - ripgrep
