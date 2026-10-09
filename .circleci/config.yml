@@ -1,0 +1,69 @@
+version: 2.1
+
+jobs:
+  workspace:
+    docker:
+      - image: cimg/rust:1.96
+    environment:
+      RUST_BACKTRACE: "1"
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - cargo-workspace-v1-rust-1.96-{{ arch }}-{{ checksum "Cargo.lock" }}
+      - run:
+          name: Install workspace dependencies
+          command: cargo fetch --locked
+      - save_cache:
+          key: cargo-workspace-v1-rust-1.96-{{ arch }}-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+      - run:
+          name: Build workspace
+          command: |
+            cargo build --verbose --workspace
+            cargo build --verbose --workspace --features pcre2
+      - run:
+          name: Test workspace
+          command: |
+            cargo test --verbose --workspace --features unstable-index
+            cargo test --verbose --workspace --features pcre2
+      - run:
+          name: Check formatting
+          command: cargo fmt --all --check
+      - run:
+          name: Check documentation
+          environment:
+            RUSTDOCFLAGS: "-D warnings"
+          command: cargo doc --no-deps --document-private-items --workspace
+
+  fuzz:
+    docker:
+      - image: cimg/rust:1.96
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - cargo-fuzz-v1-rust-1.96-{{ arch }}-{{ checksum "fuzz/Cargo.lock" }}
+      - run:
+          name: Install fuzz dependencies and tooling
+          working_directory: ~/project/fuzz
+          command: |
+            cargo fetch --locked
+            cargo install cargo-fuzz
+      - save_cache:
+          key: cargo-fuzz-v1-rust-1.96-{{ arch }}-{{ checksum "fuzz/Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+      - run:
+          name: Compile fuzz targets
+          working_directory: ~/project/fuzz
+          command: cargo check
+
+workflows:
+  ci:
+    jobs:
+      - workspace
+      - fuzz
