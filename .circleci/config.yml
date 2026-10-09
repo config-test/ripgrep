@@ -1,0 +1,72 @@
+version: 2.1
+
+# Starter CI for ripgrep.
+#
+# Two Cargo projects live in this repo:
+#   * the root workspace (ripgrep plus the crates/* libraries)
+#   * fuzz/, a standalone crate with its own workspace and lockfile
+#
+# Everything runs on Linux/x86_64 with the toolchain that ships in the image
+# (1.99.0, comfortably above the 1.96 MSRV in Cargo.toml). Cross compilation,
+# the musl/32-bit/big-endian targets, macOS and Windows are deliberately left
+# out of this first pass.
+
+jobs:
+  ripgrep:
+    docker:
+      - image: cimg/rust:1.99
+    environment:
+      # Matches the GitHub Actions workflow.
+      RUST_BACKTRACE: "1"
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - cargo-v1-{{ checksum "Cargo.lock" }}
+            - cargo-v1-
+      - run:
+          name: Fetch dependencies
+          command: cargo fetch --locked
+      - save_cache:
+          key: cargo-v1-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+      - run:
+          name: Build ripgrep and all crates
+          command: cargo build --verbose --workspace
+      - run:
+          name: Run tests
+          command: cargo test --verbose --workspace
+      - run:
+          name: Check formatting
+          command: cargo fmt --all --check
+
+  fuzz:
+    docker:
+      - image: cimg/rust:1.99
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - cargo-fuzz-v1-{{ checksum "fuzz/Cargo.lock" }}
+            - cargo-fuzz-v1-
+      - run:
+          name: Fetch dependencies
+          command: cargo fetch --locked
+          working_directory: fuzz
+      - save_cache:
+          key: cargo-fuzz-v1-{{ checksum "fuzz/Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+      - run:
+          name: Verify fuzz targets build
+          command: cargo check --verbose
+          working_directory: fuzz
+
+workflows:
+  ci:
+    jobs:
+      - ripgrep
+      - fuzz
